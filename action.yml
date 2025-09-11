@@ -1,0 +1,140 @@
+name: 'Kubernetes Wait'
+description: 'Wait for Kubernetes workloads to become ready. Delegates Rollout waits to KoalaOps/argo-rollouts-wait@v1.'
+author: 'KoalaOps'
+
+branding:
+  icon: 'clock'
+  color: 'purple'
+
+inputs:
+  namespace:
+    description: 'Default namespace for workloads that omit it'
+    required: true
+  workloads_json:
+    description: 'JSON array from Inspect: [{kind,name,namespace?}]. May include kind=="Rollout".'
+    required: true
+  timeout:
+    description: 'Wait timeout (e.g., 300s, 5m). Applied to all waits.'
+    required: false
+    default: '300s'
+  show_status:
+    description: 'After waiting, show kubectl status for the provided workloads'
+    required: false
+    default: 'true'
+  verify_only:
+    description: 'Pass-through to Argo Rollouts Wait when delegating (health check only)'
+    required: false
+    default: 'false'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Check required tools
+      shell: bash
+      run: |
+        set -euo pipefail
+        for b in kubectl jq; do
+          command -v "$b" >/dev/null 2>&1 || { echo "::error::Missing $b"; exit 1; }
+        done
+
+    - name: Normalize inputs
+      id: norm
+      shell: bash
+      run: |
+        set -euo pipefail
+        NS='${{ inputs.namespace }}'
+        JSON='${{ inputs.workloads_json }}'
+        echo "$JSON" | jq empty || { echo "::error::workloads_json must be valid JSON array"; exit 1; }
+
+        ROLLOUTS_JSON=$(echo "$JSON" | jq -c '[ .[] | select((.kind // "") == "Rollout") ]')
+        NON_ROLLOUTS_JSON=$(echo "$JSON" | jq -c '[ .[] | select((.kind // "") != "Rollout") ]')
+        COUNT=$(jq 'length' <<<"$ROLLOUTS_JSON")
+        FIRST_NAME=$(jq -r '.[0].name // ""' <<<"$ROLLOUTS_JSON")
+        FIRST_NS=$(jq -r '.[0].namespace // ""' <<<"$ROLLOUTS_JSON")
+
+        echo "namespace=$NS"                        >> "$GITHUB_OUTPUT"
+        echo "rollouts_json=$ROLLOUTS_JSON"         >> "$GITHUB_OUTPUT"
+        echo "non_rollouts_json=$NON_ROLLOUTS_JSON"  >> "$GITHUB_OUTPUT"
+        echo "rollouts_count=$COUNT"                >> "$GITHUB_OUTPUT"
+        echo "first_rollout_name=$FIRST_NAME"       >> "$GITHUB_OUTPUT"
+        echo "first_rollout_ns=$FIRST_NS"           >> "$GITHUB_OUTPUT"
+
+        echo "📦 Parsed $(jq 'length' <<<"$NON_ROLLOUTS_JSON") standard workloads and $COUNT rollout(s)."
+
+    - name: Validate single Rollout
+      if: ${{ fromJSON(steps.norm.outputs.rollouts_count) > 1 }}
+      shell: bash
+      run: |
+        echo "::error::Multiple Rollouts found. To avoid duplication, call KoalaOps/argo-rollouts-wait@v1 once per rollout (matrix or sequential)."
+        echo "Rollouts detected:"
+        echo '${{ steps.norm.outputs.rollouts_json }}' | jq -r '.[] | "  - \(.name) (ns: \(.namespace // "'${{ steps.norm.outputs.namespace }}'"))"'
+        exit 1
+
+    # Delegate exactly one Rollout to the Argo action
+    - name: Wait for Argo Rollout
+      if: ${{ fromJSON(steps.norm.outputs.rollouts_count) == 1 }}
+      uses: KoalaOps/argo-rollouts-wait@v1
+      with:
+        rollout_name: ${{ steps.norm.outputs.first_rollout_name }}
+        namespace: ${{ steps.norm.outputs.first_rollout_ns || steps.norm.outputs.namespace }}
+        timeout: ${{ inputs.timeout }}
+        verify_only: ${{ inputs.verify_only }}
+
+    # Wait for standard k8s workloads
+    - name: Wait for standard workloads
+      if: ${{ fromJSON(steps.norm.outputs.non_rollouts_json).length > 0 }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        NS='${{ steps.norm.outputs.namespace }}'
+        TIMEOUT='${{ inputs.timeout }}'
+        JSON='${{ steps.norm.outputs.non_rollouts_json }}'
+
+        extract() { echo "$JSON" | jq -r --arg K "$1" '.[] | select(.kind==$K) | [.name, (.namespace // "'$NS'")] | @tsv'; }
+
+        echo "⏳ Waiting for standard workloads (timeout=$TIMEOUT)"
+
+        while IFS=$'\t' read -r name ns; do
+          [ -z "$name" ] && continue
+          echo "  - Deployment/$name (ns: $ns)"
+          kubectl rollout status "deployment/$name" -n "$ns" --timeout "$TIMEOUT"
+        done < <(extract "Deployment")
+
+        while IFS=$'\t' read -r name ns; do
+          [ -z "$name" ] && continue
+          echo "  - StatefulSet/$name (ns: $ns)"
+          kubectl rollout status "statefulset/$name" -n "$ns" --timeout "$TIMEOUT" || true
+        done < <(extract "StatefulSet")
+
+        while IFS=$'\t' read -r name ns; do
+          [ -z "$name" ] && continue
+          echo "  - DaemonSet/$name (ns: $ns)"
+          kubectl rollout status "daemonset/$name" -n "$ns" --timeout "$TIMEOUT" || true
+        done
+
+        echo "✅ Standard workloads are ready."
+
+    - name: Show status
+      if: inputs.show_status == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        NS='${{ steps.norm.outputs.namespace }}'
+        ALL='${{ inputs.workloads_json }}'
+        if [ -z "$ALL" ] || [ "$ALL" = "[]" ]; then
+          echo "📊 No workloads provided for status."
+          exit 0
+        fi
+        echo "📊 Final status for provided workloads:"
+        echo "$ALL" | jq -r '.[] | "\(.kind)\t\(.name)\t\(.namespace // "")"' | \
+        while IFS=$'\t' read -r kind name ns; do
+          [ -z "$kind" ] && continue
+          RES_NS="${ns:-$NS}"
+          echo "— $kind/$name (ns: $RES_NS)"
+          if [ "$kind" = "Rollout" ]; then
+            # Only a summary; full details come from the delegated action
+            kubectl argo rollouts get rollout "$name" -n "$RES_NS" --no-color || true
+          else
+            kubectl get "$kind" "$name" -n "$RES_NS" -o wide || true
+          fi
+        done
