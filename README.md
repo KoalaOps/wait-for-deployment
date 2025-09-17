@@ -1,90 +1,142 @@
-# Argo Rollouts Wait
+# Kubernetes Wait for Deployment
 
-Waits for an Argo Rollout to complete with configurable timeout and health verification.
+Waits for Kubernetes workloads to become ready with automatic Argo Rollout delegation.
 
 ## Features
 
-- ⏳ **Configurable timeout** - Set maximum wait time
-- 🔍 **Health monitoring** - Tracks rollout status
-- 📊 **Detailed output** - Returns status, message, and revision
-- 🔧 **Plugin management** - Auto-installs kubectl plugin
-- 📝 **Summary generation** - GitHub Actions summary
+- ⏳ **Universal workload support** - Deployments, StatefulSets, DaemonSets, and Rollouts
+- 🔄 **Automatic Rollout delegation** - Seamlessly handles Argo Rollouts via `wait-for-rollout`
+- 📊 **Batch processing** - Wait for multiple workloads from kustomize-inspect output
+- 🎯 **Smart namespace handling** - Automatic namespace resolution
+- 📝 **Status reporting** - Detailed workload status after waiting
 
 ## Usage
 
 ```yaml
-- name: Wait for rollout
-  uses: KoalaOps/wait-for-rollout@v1
+- name: Wait for deployments
+  uses: KoalaOps/wait-for-deployment@v1
   with:
-    rollout_name: backend
     namespace: production
-    timeout: 600s
+    workloads_json: '[{"kind":"Deployment","name":"api"},{"kind":"StatefulSet","name":"db"}]'
+    timeout: 5m
 ```
 
 ## Inputs
 
 | Input | Description | Required | Default |
 |-------|-------------|----------|---------|
-| `rollout_name` | Name of the Argo Rollout | ✅ | - |
-| `namespace` | Kubernetes namespace | ❌ | `default` |
-| `timeout` | Maximum wait time (e.g., 300s, 5m, 10m) | ❌ | `300s` |
-| `verify_only` | Only verify health without promoting | ❌ | `false` |
-| `install_plugin` | Install Argo Rollouts kubectl plugin | ❌ | `true` |
-| `plugin_version` | Plugin version to install | ❌ | `latest` |
+| `namespace` | Default namespace for workloads | ✅ | - |
+| `workloads_json` | JSON array of workloads: `[{kind,name,namespace?}]` | ✅ | - |
+| `timeout` | Wait timeout (e.g., 300s, 5m) | ❌ | `300s` |
+| `show_status` | Show kubectl status after waiting | ❌ | `true` |
+| `verify_only` | Pass-through for Rollout verification | ❌ | `false` |
 
-## Outputs
+## Supported Workload Types
 
-| Output | Description | Example |
-|--------|-------------|---------|
-| `status` | Final rollout status | `Healthy`, `Degraded`, `Progressing` |
-| `message` | Status message | `Rollout is healthy` |
-| `revision` | Current revision number | `5` |
+- **Deployment** - Standard Kubernetes deployments
+- **StatefulSet** - Stateful applications
+- **DaemonSet** - Node-level workloads
+- **Rollout** - Argo Rollouts (delegated to `wait-for-rollout@v1`)
 
 ## Examples
 
-### Basic usage
+### Basic Deployment Wait
 ```yaml
 - name: Deploy and wait
   run: kubectl apply -f manifests/
 
-- name: Wait for rollout
-  uses: KoalaOps/wait-for-rollout@v1
+- name: Wait for deployment
+  uses: KoalaOps/wait-for-deployment@v1
   with:
-    rollout_name: my-service
     namespace: production
+    workloads_json: '[{"kind":"Deployment","name":"frontend"}]'
 ```
 
-### With custom timeout
+### Multiple Workloads
 ```yaml
-- name: Wait for complex rollout
-  uses: KoalaOps/wait-for-rollout@v1
+- name: Wait for all services
+  uses: KoalaOps/wait-for-deployment@v1
   with:
-    rollout_name: backend
-    namespace: staging
-    timeout: 15m  # Long timeout for canary
-```
-
-### Verify only mode
-```yaml
-- name: Check rollout health
-  uses: KoalaOps/wait-for-rollout@v1
-  with:
-    rollout_name: frontend
-    namespace: production
-    verify_only: true  # Don't promote, just check
-```
-
-### With specific plugin version
-```yaml
-- name: Wait with specific plugin
-  uses: KoalaOps/wait-for-rollout@v1
-  with:
-    rollout_name: api
     namespace: default
-    plugin_version: v1.6.0
+    workloads_json: |
+      [
+        {"kind":"Deployment","name":"api"},
+        {"kind":"Deployment","name":"worker"},
+        {"kind":"StatefulSet","name":"database"}
+      ]
+    timeout: 10m
 ```
 
-### Complete deployment flow
+### With Kustomize Inspect
+```yaml
+- name: Inspect manifests
+  id: inspect
+  uses: KoalaOps/kustomize-inspect@v1
+  with:
+    overlay_path: overlays/production
+
+- name: Wait for workloads
+  uses: KoalaOps/wait-for-deployment@v1
+  with:
+    namespace: production
+    workloads_json: ${{ steps.inspect.outputs.workloads }}
+```
+
+### Mixed Standard and Rollout Workloads
+```yaml
+- name: Wait for mixed workloads
+  uses: KoalaOps/wait-for-deployment@v1
+  with:
+    namespace: production
+    workloads_json: |
+      [
+        {"kind":"Deployment","name":"frontend"},
+        {"kind":"Rollout","name":"api"},
+        {"kind":"StatefulSet","name":"cache"}
+      ]
+```
+
+### With Custom Namespaces
+```yaml
+- name: Wait across namespaces
+  uses: KoalaOps/wait-for-deployment@v1
+  with:
+    namespace: default  # Fallback for workloads without namespace
+    workloads_json: |
+      [
+        {"kind":"Deployment","name":"api","namespace":"backend"},
+        {"kind":"Deployment","name":"web","namespace":"frontend"},
+        {"kind":"StatefulSet","name":"db"}
+      ]
+```
+
+## How It Works
+
+1. **Parses workload list** - Processes the JSON array of workloads
+2. **Separates by type** - Identifies standard K8s workloads vs Argo Rollouts
+3. **Delegates Rollouts** - Automatically uses `wait-for-rollout@v1` for Rollout resources
+4. **Waits for standard workloads** - Uses `kubectl rollout status` for Deployments, StatefulSets, DaemonSets
+5. **Reports status** - Shows final status for all workloads
+
+## Rollout Delegation
+
+When a Rollout is detected in the workload list:
+- Automatically delegates to `KoalaOps/wait-for-rollout@v1`
+- Passes through timeout and verify_only parameters
+- Supports only one Rollout per action invocation (use matrix for multiple)
+
+## Error Handling
+
+The action will fail if:
+- Any Deployment fails to become ready
+- Timeout is exceeded
+- Multiple Rollouts are provided (use matrix strategy instead)
+- kubectl connection fails
+
+Note: StatefulSet and DaemonSet failures are non-blocking by default.
+
+## Complete Deployment Flow
+
 ```yaml
 jobs:
   deploy:
@@ -99,90 +151,39 @@ jobs:
           region: us-east-1
           cluster: production
       
-      - name: Apply manifests
+      - name: Build manifests
+        id: build
         run: |
-          kustomize build overlays/production | kubectl apply -f -
+          kustomize build overlays/production > manifests.yaml
+          kubectl apply -f manifests.yaml
       
-      - name: Wait for rollout
-        uses: KoalaOps/wait-for-rollout@v1
+      - name: Get workloads
+        id: inspect
+        uses: KoalaOps/kustomize-inspect@v1
         with:
-          rollout_name: ${{ env.SERVICE_NAME }}
+          overlay_path: overlays/production
+      
+      - name: Wait for all workloads
+        uses: KoalaOps/wait-for-deployment@v1
+        with:
           namespace: production
+          workloads_json: ${{ steps.inspect.outputs.workloads }}
           timeout: 10m
       
-      - name: Run smoke tests
+      - name: Run tests
         if: success()
-        run: ./scripts/smoke-test.sh production
-```
-
-## Rollout Strategies
-
-The action supports all Argo Rollouts strategies:
-
-### Canary
-```yaml
-# Waits for canary to complete
-- uses: KoalaOps/wait-for-rollout@v1
-  with:
-    rollout_name: my-canary
-    timeout: 20m  # Longer for gradual rollout
-```
-
-### Blue-Green
-```yaml
-# Waits for blue-green switch
-- uses: KoalaOps/wait-for-rollout@v1
-  with:
-    rollout_name: my-bluegreen
-    timeout: 5m  # Faster switch
-```
-
-### Progressive Delivery
-```yaml
-# Monitors progressive stages
-- uses: KoalaOps/wait-for-rollout@v1
-  with:
-    rollout_name: my-progressive
-    timeout: 30m  # Multiple stages
+        run: ./scripts/smoke-test.sh
 ```
 
 ## Prerequisites
 
 - Kubernetes cluster access (configured kubectl)
-- Argo Rollouts installed in the cluster
+- For Rollouts: Argo Rollouts installed in cluster
 - Appropriate RBAC permissions
-
-## Plugin Installation
-
-The action automatically installs the kubectl-argo-rollouts plugin if not present.
-
-To skip installation (if pre-installed):
-```yaml
-- uses: KoalaOps/wait-for-rollout@v1
-  with:
-    rollout_name: my-service
-    install_plugin: false
-```
-
-## Error Handling
-
-The action will fail if:
-- Rollout doesn't exist
-- Timeout is exceeded
-- Rollout enters Degraded state
-- kubectl connection fails
-
-## Monitoring Output
-
-The action provides detailed status in GitHub Actions summary:
-- Rollout name and namespace
-- Final status and message
-- Revision number
-- Success/failure indication
 
 ## Notes
 
 - Requires kubectl context to be configured
-- Use with cloud-login action for authentication
-- Timeout format supports: seconds (300s), minutes (5m), hours (1h)
-- verify_only mode useful for health checks without side effects
+- Use with `cloud-login` action for authentication
+- For multiple Rollouts, use matrix strategy or sequential calls
+- Timeout applies to each workload wait operation
